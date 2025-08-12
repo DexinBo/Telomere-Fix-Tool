@@ -16,6 +16,7 @@ Key Features
 
 
 ## Usage
+```
 python3 replace_telomeres.py [-h] -r REFERENCE -c CONSENSUS -o OUTPUT [-m {replace,splice}] [-i MIN_IDENTITY] [-l MIN_LENGTH]
                              [-e END_REGION] [-p PROCESSES] [-s START_THRESHOLD]
 
@@ -42,4 +43,4 @@ options:
   -p PROCESSES, --processes PROCESSES
                         Number of parallel processes to use (default: 8).
   -s START_THRESHOLD, --start_threshold START_THRESHOLD
-                        Maximum start position (in bp) on the contig ends for a valid alignment (default: 1000).
+                        Maximum start position (in bp) on the contig ends for a valid alignment (default: 1000).```
