@@ -265,7 +265,6 @@ def process_ref_sequence(
 
 
 def main():
-    # The main function is identical to the previous version
     parser = argparse.ArgumentParser(
         description="Modify chromosome ends (telomeres) with a consensus sequence using MUMmer.",
         formatter_class=argparse.RawTextHelpFormatter,
