@@ -1,270 +1,347 @@
 #!/usr/bin/env python3
-import os
-import re
-import subprocess
-import tempfile
-import shutil
-import logging
-from Bio import SeqIO
-from Bio.SeqRecord import SeqRecord
-from Bio.Seq import Seq
-import concurrent.futures
-from typing import Dict, Optional, List
+
 import argparse
+import logging
+import logging.handlers
+import os
+import subprocess
 import sys
+import tempfile
+import multiprocessing
+import threading
+from collections import namedtuple
+from typing import List, Optional, Dict, Tuple
+from itertools import repeat
+from concurrent.futures import ProcessPoolExecutor
 
-# 配置日志系统
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+from Bio import SeqIO
+from Bio.Seq import Seq
+from Bio.SeqRecord import SeqRecord
 
-def find_mummer_path() -> None:
-    """Find the path to nucmer, delta-filter, and show-coords."""
-    for tool in ['nucmer', 'delta-filter', 'show-coords']:
-        if not shutil.which(tool):
-            raise EnvironmentError(
-                f"'{tool}' not found in PATH. Please ensure MUMmer is installed and accessible."
-            )
-    logger.info("MUMmer tools (nucmer, delta-filter, show-coords) found in PATH.")
+# --- 1. Logging Queue Configuration ---
+def log_listener_process(queue: multiprocessing.Queue):
+    log_format = '%(asctime)s - %(processName)s - %(levelname)s - \n%(message)s\n'
+    root = logging.getLogger()
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(log_format, datefmt='%Y-%m-%d %H:%M:%S')
+    handler.setFormatter(formatter)
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    while True:
+        try:
+            record = queue.get()
+            if record is None: break
+            logger = logging.getLogger(record.name)
+            logger.handle(record)
+        except Exception:
+            import traceback
+            print('Error in log listener:', file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
 
-def run_nucmer(ref_fa: str, qry_fa: str, output_prefix: str, min_identity: float = 80, min_length: int = 1000) -> str:
-    """
-    Runs nucmer alignment and filters the results.
-    The ref_fa and qry_fa can now contain multiple sequences.
-    Uses list form for subprocess.run for better security.
-    """
-    delta_file = f"{output_prefix}.delta"
-    filtered_delta_file = f"{output_prefix}.filtered.delta"
-    coords_file = f"{output_prefix}.coords"
+def worker_configurer(queue: multiprocessing.Queue):
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.handlers.QueueHandler(queue)
+        root.addHandler(handler)
+        root.setLevel(logging.INFO)
 
-    # nucmer command
-    cmd_nucmer = ["nucmer", "--maxmatch", f"--prefix={output_prefix}", ref_fa, qry_fa]
-    logger.debug(f"Running nucmer: {' '.join(cmd_nucmer)}")
-    subprocess.run(cmd_nucmer, check=True, capture_output=True)
+# --- 2. Core Processing Logic ---
+Alignment = namedtuple('Alignment', ['s_start','s_end','q_start','q_end','s_len','q_len','identity','s_strand','q_strand','s_name','q_name'])
 
-    # delta-filter command
-    cmd_filter = ["delta-filter", "-i", str(min_identity), "-l", str(min_length), delta_file]
-    logger.debug(f"Running delta-filter: {' '.join(cmd_filter)}")
-    with open(filtered_delta_file, "w") as outfile:
-        subprocess.run(cmd_filter, check=True, stdout=outfile)
-
-    # show-coords command
-    cmd_coords = ["show-coords", "-rclT", filtered_delta_file]
-    logger.debug(f"Running show-coords: {' '.join(cmd_coords)}")
-    with open(coords_file, "w") as outfile:
-        subprocess.run(cmd_coords, check=True, stdout=outfile)
-
-    return coords_file
-
-def parse_coords_for_ends_optimized(coords_file: str) -> tuple[Optional[Dict], Optional[Dict]]:
-    """
-    Parses alignment results from nucmer run on extracted end sequences.
-    Finds the best hit for both 5' and 3' ends based on a combined score
-    of identity and alignment length. This function no longer filters by position.
-    """
-    best_5_end_hit = None
-    best_3_end_hit = None
-    
-    best_5_end_score = -1.0
-    best_3_end_score = -1.0
-
-    with open(coords_file) as f:
-        for line in f:
-            if line.startswith('/') or line.startswith('[') or not line.strip():
-                continue
-            
-            try:
-                cols = line.strip().split('\t')
-                if len(cols) < 13: continue
-
-                ref_start, ref_end = int(cols[0]), int(cols[1])
-                qry_start, qry_end = int(cols[2]), int(cols[3])
-                identity = float(cols[6])
-                ref_id = cols[11]
-                qry_id = cols[12]
-                
-                alignment_length = ref_end - ref_start + 1
-                current_score = identity * alignment_length
-                
-                current_hit = {
-                    "ref_start": ref_start, "ref_end": ref_end,
-                    "qry_start": qry_start, "qry_end": qry_end,
-                    "identity": identity,
-                    "qry_id": qry_id,
-                    "ref_id": ref_id
-                }
-
-                if ref_id.endswith("_5end"):
-                    if current_score > best_5_end_score:
-                        best_5_end_score = current_score
-                        best_5_end_hit = current_hit
-                elif ref_id.endswith("_3end"):
-                    if current_score > best_3_end_score:
-                        best_3_end_score = current_score
-                        best_3_end_hit = current_hit
-
-            except (IndexError, ValueError) as e:
-                logger.warning(f"Skipping malformed line in coords file: '{line.strip()}' due to error: {e}")
-                continue
-
-    return best_5_end_hit, best_3_end_hit
-
-def process_single_contig(chr_rec: SeqRecord, consensus_fa: str, consensus_seqs: Dict[str, str], min_identity: float, end_region: int, start_threshold: int) -> SeqRecord:
-    """
-    Processes a single contig by extracting its ends, running nucmer on them,
-    and replacing the ends if significant alignments are found.
-    """
+def run_command(command: list):
     try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            chr_length = len(chr_rec.seq)
-            
-            # 1. Create a temporary FASTA file containing only the 5' and 3' end sequences
-            ends_records = []
-            
-            seq_5_end = chr_rec.seq[:min(end_region, chr_length)]
-            rec_5_end = SeqRecord(seq_5_end, id=f"{chr_rec.id}_5end", description="")
-            ends_records.append(rec_5_end)
-            
-            if chr_length > end_region:
-                seq_3_end = chr_rec.seq[-end_region:]
-                rec_3_end = SeqRecord(seq_3_end, id=f"{chr_rec.id}_3end", description="")
-                ends_records.append(rec_3_end)
-            
-            temp_ends_fa = os.path.join(temp_dir, f"ends_{chr_rec.id}.fasta")
-            with open(temp_ends_fa, "w") as f:
-                SeqIO.write(ends_records, f, "fasta")
-            
-            output_prefix = os.path.join(temp_dir, f"align_{chr_rec.id}")
-            
-            # 2. Run nucmer using the extracted end sequences as reference
-            coords_file = run_nucmer(temp_ends_fa, consensus_fa, output_prefix, min_identity)
-            
-            # 3. Parse results from the optimized coords file
-            best_5_hit, best_3_hit = parse_coords_for_ends_optimized(coords_file)
+        result = subprocess.run(command, check=True, capture_output=True, text=True)
+        return result.stdout
+    except FileNotFoundError:
+        logging.error(f"Command '{command[0]}' not found.")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Command '{' '.join(command)}' failed: {e.stderr.strip()}")
 
-            new_seq_list = list(str(chr_rec.seq))
-            
-            # 5' End Replacement
-            if best_5_hit and best_5_hit['qry_id'] in consensus_seqs:
-                # 检查比对是否在 contig 前 start_threshold bp内
-                if best_5_hit['ref_start'] > start_threshold:
-                    logger.info(f"Found 5' end hit, but alignment start position ({best_5_hit['ref_start']}) is not within the first {start_threshold}bp. Skipping replacement.")
-                    best_5_hit = None
-                else:
-                    chr_align_start_5 = best_5_hit['ref_start']
-                    chr_align_end_5 = best_5_hit['ref_end']
-                    
-                    replace_seq_5 = consensus_seqs[best_5_hit['qry_id']][0:best_5_hit['qry_end']]
-                    
-                    original_len_5 = len("".join(new_seq_list))
-                    new_seq_list = list(replace_seq_5 + "".join(new_seq_list[best_5_hit['ref_end']:]))
-                    new_len_5 = len("".join(new_seq_list))
-                    
-                    logger.info(f"Replaced 5'end hit for '{chr_rec.id}' from [{chr_align_start_5}-{chr_align_end_5}] (orig_len:{original_len_5}, new_len:{new_len_5}) on consensus '{best_5_hit['qry_id']}' with {best_5_hit['identity']:.2f}% identity.")
-            else:
-                logger.info(f"No significant alignment found at the 5' end for '{chr_rec.id}'.")
+def parse_show_coords(coords_output: str) -> List[Alignment]:
+    alignments = []
+    lines = coords_output.strip().split('\n')
+    data_lines = [line for line in lines if not line.startswith('[') and not line.startswith('=')]
+    if data_lines and data_lines[0].startswith('S1'): data_lines = data_lines[1:]
+    for line in data_lines:
+        if not line.strip(): continue
+        parts = line.split('\t')
+        try:
+            s_start,s_end,q_start,q_end,s_len,q_len,identity,s_name,q_name = int(parts[0]),int(parts[1]),int(parts[2]),int(parts[3]),int(parts[4]),int(parts[5]),float(parts[6]),parts[9],parts[10]
+            q_strand = '-' if int(parts[8]) < 0 else '+'
+            alignments.append(Alignment(s_start,s_end,q_start,q_end,s_len,q_len,identity,'+',q_strand,s_name,q_name))
+        except (ValueError, IndexError): continue
+    return alignments
 
-            # 3' End Replacement
-            if best_3_hit and best_3_hit['qry_id'] in consensus_seqs:
-                chr_align_start_3_abs = best_3_hit['ref_start'] + (chr_length - end_region)
-
-                # 检查比对是否在 contig 末尾 start_threshold bp内
-                if chr_align_start_3_abs < chr_length - start_threshold:
-                    logger.info(f"Found 3' end hit, but alignment start position ({chr_align_start_3_abs}) is not within the last {start_threshold}bp of contig length ({chr_length}). Skipping replacement.")
-                    best_3_hit = None
-                else:
-                    chr_align_end_3_abs = best_3_hit['ref_end'] + (chr_length - end_region)
-                    current_chr_len = len("".join(new_seq_list))
-                    len_change = current_chr_len - chr_length
-                    
-                    adjusted_ref_start = chr_align_start_3_abs + len_change
-                    
-                    replace_seq_3 = consensus_seqs[best_3_hit['qry_id']][best_3_hit['qry_start']-1:]
-                    
-                    original_len_3 = len("".join(new_seq_list))
-                    new_seq_list = list("".join(new_seq_list[:adjusted_ref_start-1]) + replace_seq_3)
-                    new_len_3 = len("".join(new_seq_list))
-                    
-                    logger.info(f"Replaced 3'end hit for '{chr_rec.id}' from [{chr_align_start_3_abs}-{chr_align_end_3_abs}] (orig_len:{original_len_3}, new_len:{new_len_3}) on consensus '{best_3_hit['qry_id']}' with {best_3_hit['identity']:.2f}% identity.")
-            else:
-                logger.info(f"No significant alignment found at the 3' end for '{chr_rec.id}'.")
-            
-            final_seq = "".join(new_seq_list)
-            return SeqRecord(Seq(final_seq), id=f"{chr_rec.id}_telomeres_replaced", description="")
-    
-    except Exception as e:
-        logger.error(f"Error processing contig '{chr_rec.id}': {e}", exc_info=True)
-        return chr_rec
-
-def replace_telomeres_multi(original_fa: str, consensus_fa: str, output_fa: str, min_identity: float = 80, end_region: int = 20000, num_workers: int = 4, start_threshold: int = 100) -> None:
+def find_best_end_alignment(alignments: List[Alignment], ref_len: int, end_type: str, min_identity: float, min_length: int, end_distance: int) -> Tuple[Optional[Alignment], Optional[Alignment]]:
     """
-    Main function now uses a ProcessPoolExecutor for parallel processing
-    and optimizes nucmer calls by only aligning contig ends.
+    Filters for the best end alignment.
+    Returns: (The best alignment that fully meets the criteria, The best candidate that meets positional criteria but may fail others)
     """
-    find_mummer_path()
+    best_valid_aln, best_valid_score = None, (-1,-1)
+    best_candidate_aln, best_candidate_score = None, (-1,-1)
+    for aln in alignments:
+        is_geometric_candidate = False
+        if end_type == '5prime':
+            if aln.s_start <= end_distance: is_geometric_candidate = True
+        elif end_type == '3prime':
+            if aln.s_end >= (ref_len - end_distance): is_geometric_candidate = True
+        
+        if is_geometric_candidate:
+            current_score = (aln.identity, aln.s_len)
+            if current_score > best_candidate_score:
+                best_candidate_score, best_candidate_aln = current_score, aln
+            
+            is_valid = aln.identity >= min_identity and aln.s_len >= min_length
+            if is_valid and current_score > best_valid_score:
+                best_valid_score, best_valid_aln = current_score, aln
+                
+    return best_valid_aln, best_candidate_aln
 
-    consensus_seqs = {rec.id: str(rec.seq) for rec in SeqIO.parse(consensus_fa, "fasta")}
-    logger.info(f"Loaded {len(consensus_seqs)} consensus telomere sequences.")
+def align_fragment(fragment_record: SeqRecord, consensus_file_path: str, params: argparse.Namespace) -> List[Alignment]:
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix=".fasta") as tmp_frag_file:
+        SeqIO.write(fragment_record, tmp_frag_file, "fasta")
+        tmp_frag_path = tmp_frag_file.name
     
-    all_contigs = list(SeqIO.parse(original_fa, "fasta"))
-    total_contigs = len(all_contigs)
-    logger.info(f"Total contigs to process: {total_contigs}")
+    prefix = tempfile.mktemp()
+    delta_path = f"{prefix}.delta"
+    filtered_delta_path = f"{prefix}.delta.filter"
 
-    modified_records = []
+    try:
+        nucmer_command = ["nucmer", "--maxmatch", "--threads", str(params.nucmer_threads), "-p", prefix, tmp_frag_path, consensus_file_path]
+        run_command(nucmer_command)
+        
+        delta_filter_command = ["delta-filter", "-i", "80", delta_path]
+        filtered_delta_output = run_command(delta_filter_command)
+        
+        with open(filtered_delta_path, 'w') as f:
+            f.write(filtered_delta_output)
+
+        coords_output = run_command(["show-coords", "-THrd", filtered_delta_path])
+
+    finally:
+        os.remove(tmp_frag_path)
+        if os.path.exists(delta_path):
+            os.remove(delta_path)
+        if os.path.exists(filtered_delta_path): 
+            os.remove(filtered_delta_path)
     
-    with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = {
-            executor.submit(
-                process_single_contig,
-                chr_rec,
-                consensus_fa,
-                consensus_seqs,
-                min_identity,
-                end_region,
-                start_threshold
-            ): chr_rec.id
-            for chr_rec in all_contigs
-        }
+    return parse_show_coords(coords_output)
 
-        for future in concurrent.futures.as_completed(futures):
-            modified_records.append(future.result())
-
-    with open(output_fa, "w") as f:
-        SeqIO.write(modified_records, f, "fasta")
+def process_ref_sequence(
+        ref_record: SeqRecord,
+        consensus_records_dict: Dict[str, SeqRecord],
+        consensus_file_path: str,
+        params: argparse.Namespace
+) -> SeqRecord:
+    """Core processing function, generates a detailed multi-line report."""
+    report_lines = []
+    ref_len = len(ref_record.seq)
+    margin = params.search_margin
+    report_lines.append(f"--- Processing Report for: {ref_record.id} (Mode: {params.mode}) (Length: {ref_len} bp) ---")
     
-    logger.info(f"\nProcess complete. All {len(modified_records)} sequences saved to {output_fa}")
-    
-####################
+    best_5p_aln, best_3p_aln = None, None
 
-if __name__ == "__main__":
+    # 1. Process 5' end
+    five_prime_len = min(ref_len, margin)
+    alignments_5p = align_fragment(ref_record[:five_prime_len], consensus_file_path, params)
+    valid_5p_aln, candidate_5p_aln = find_best_end_alignment(alignments_5p, five_prime_len, '5prime', params.min_identity, params.min_length, params.end_distance)
     
-    full_command = "python3 " + " ".join(sys.argv)
-    logger.info(f"Command run: {full_command}")
+    if valid_5p_aln:
+        best_5p_aln = valid_5p_aln
+        consensus_len = len(consensus_records_dict[best_5p_aln.q_name].seq)
+        report_lines.append(
+            f"  [5' End] ✓ Best match found: Consensus='{best_5p_aln.q_name}'(Len:{consensus_len}), Identity={best_5p_aln.identity:.2f}%, "
+            f"RefPos=[{best_5p_aln.s_start}:{best_5p_aln.s_end}], ConsensusPos=[{best_5p_aln.q_start}:{best_5p_aln.q_end}], "
+            f"AlnLength={best_5p_aln.s_len}")
+    elif candidate_5p_aln:
+        consensus_len = len(consensus_records_dict[candidate_5p_aln.q_name].seq)
+        report_lines.append(
+            f"  [5' End] ✗ No qualified match. Closest candidate: Consensus='{candidate_5p_aln.q_name}'(Len:{consensus_len}), Identity={candidate_5p_aln.identity:.2f}%, "
+            f"RefPos=[{candidate_5p_aln.s_start}:{candidate_5p_aln.s_end}], ConsensusPos=[{candidate_5p_aln.q_start}:{candidate_5p_aln.q_end}], "
+            f"AlnLength={candidate_5p_aln.s_len} (Thresholds: Length>={params.min_length}, Identity>={params.min_identity}%)")
+    else:
+        report_lines.append("  [5' End] ✗ No alignments found in the terminal region.")
 
+    # 2. Process 3' end
+    if ref_len > margin:
+        three_prime_len = min(ref_len, margin)
+        alignments_3p = align_fragment(ref_record[-three_prime_len:], consensus_file_path, params)
+        valid_3p_aln_frag, candidate_3p_aln_frag = find_best_end_alignment(alignments_3p, three_prime_len, '3prime', params.min_identity, params.min_length, params.end_distance)
+        
+        if valid_3p_aln_frag:
+            offset = ref_len - three_prime_len
+            best_3p_aln = valid_3p_aln_frag._replace(s_start=valid_3p_aln_frag.s_start + offset, s_end=valid_3p_aln_frag.s_end + offset)
+            consensus_len = len(consensus_records_dict[best_3p_aln.q_name].seq)
+            report_lines.append(
+                f"  [3' End] ✓ Best match found: Consensus='{best_3p_aln.q_name}'(Len:{consensus_len}), Identity={best_3p_aln.identity:.2f}%, "
+                f"RefPos=[{best_3p_aln.s_start}:{best_3p_aln.s_end}], ConsensusPos=[{best_3p_aln.q_start}:{best_3p_aln.q_end}], "
+                f"AlnLength={best_3p_aln.s_len}")
+        elif candidate_3p_aln_frag:
+            consensus_len = len(consensus_records_dict[candidate_3p_aln_frag.q_name].seq)
+            report_lines.append(
+                f"  [3' End] ✗ No qualified match. Closest candidate: Consensus='{candidate_3p_aln_frag.q_name}'(Len:{consensus_len}), Identity={candidate_3p_aln_frag.identity:.2f}%, "
+                f"RefPos(frag):[{candidate_3p_aln_frag.s_start}:{candidate_3p_aln_frag.s_end}], ConsensusPos=[{candidate_3p_aln_frag.q_start}:{candidate_3p_aln_frag.q_end}], "
+                f"AlnLength={candidate_3p_aln_frag.s_len} (Thresholds: Length>={params.min_length}, Identity>={params.min_identity}%)")
+        else:
+            report_lines.append("  [3' End] ✗ No alignments found in the terminal region.")
+
+    # 3. Modify sequence and generate final report
+    original_len = len(ref_record.seq)
+    modified_description = []
+    
+    prefix, suffix = Seq(""), Seq("")
+    middle_start_idx, middle_end_idx = 0, original_len
+    
+    if params.mode == 'replace':
+        if best_5p_aln:
+            consensus = consensus_records_dict[best_5p_aln.q_name].seq
+            if best_5p_aln.q_strand == '+':
+                # Forward alignment (Ref head vs Con head): slice the entire head of the Consensus from the start to the end of the alignment (q_end)
+                prefix = consensus[:best_5p_aln.q_end]
+            else:
+                # Reverse alignment (Ref head vs Con tail): q_end is smaller; slice the entire Consensus tail including the alignment region (from q_end to the end) and use its reverse complement to replace the Ref's head
+                tail_to_replace_with = consensus[best_5p_aln.q_end - 1:]
+                prefix = tail_to_replace_with.reverse_complement()
+
+            middle_start_idx = best_5p_aln.s_end
+            modified_description.append("5p")
+
+        if best_3p_aln:
+            consensus = consensus_records_dict[best_3p_aln.q_name].seq
+            if best_3p_aln.q_strand == '+':
+                # Forward alignment (Ref tail vs Con tail): slice the entire tail of the Consensus from the start of the alignment (q_start) to the end
+                suffix = consensus[best_3p_aln.q_start - 1:]
+            else:
+                # Reverse alignment (Ref tail vs Con head): q_start is larger; slice the entire Consensus head including the alignment region (from the start to q_start) and use its reverse complement to replace the Ref's tail
+                head_to_replace_with = consensus[:best_3p_aln.q_start]
+                suffix = head_to_replace_with.reverse_complement()
+
+            middle_end_idx = best_3p_aln.s_start - 1
+            if "3p" not in modified_description: modified_description.append("3p")
+
+    elif params.mode == 'stitch':
+        if best_5p_aln:
+            consensus = consensus_records_dict[best_5p_aln.q_name].seq
+            
+            if best_5p_aln.q_strand == '+':
+                # Forward alignment (Ref head vs Con head): slice the prefix of the Consensus
+                prefix = consensus[:best_5p_aln.q_start - 1]
+            else:
+                # Reverse alignment (Ref head vs Con tail): q_start is larger; slice the tail of the original Consensus (from q_start onwards) and use its reverse complement as the prefix for the Ref
+                tail_to_add = consensus[best_5p_aln.q_start:]
+                prefix = tail_to_add.reverse_complement()
+            
+            middle_start_idx = best_5p_aln.s_start - 1
+            modified_description.append("5p")
+
+        if best_3p_aln:
+            consensus = consensus_records_dict[best_3p_aln.q_name].seq
+            
+            if best_3p_aln.q_strand == '+':
+                # Forward alignment (Ref tail vs Con tail): slice the suffix of the Consensus
+                suffix = consensus[best_3p_aln.q_end:]
+            else:
+                # Reverse alignment (Ref tail vs Con head): q_end is smaller; slice the head of the original Consensus (up to q_end) and use its reverse complement as the suffix for the Ref
+                head_to_add = consensus[:best_3p_aln.q_end - 1]
+                suffix = head_to_add.reverse_complement()
+
+            middle_end_idx = best_3p_aln.s_end
+            if "3p" not in modified_description: modified_description.append("3p")
+
+    if modified_description:
+        middle = ref_record.seq[middle_start_idx:middle_end_idx]
+        modified_seq = prefix + middle + suffix
+        result_summary = f"  [Result] Sequence MODIFIED (mode: {params.mode}, ends: {','.join(modified_description)}). Original Length: {original_len}, New Length: {len(modified_seq)}"
+        new_record = SeqRecord(modified_seq, id=f"{ref_record.id}_ends_modified", description=result_summary)
+    else:
+        result_summary = f"  [Result] Sequence NOT modified."
+        new_record = ref_record
+
+    report_lines.append(result_summary)
+    logging.info("\n".join(report_lines))
+
+    return new_record
+
+
+def main():
+    # The main function is identical to the previous version
     parser = argparse.ArgumentParser(
-        description='Replace chromosome ends (telomeres) with a consensus sequence using MUMmer. Now with parallel processing and optimized end-only alignment.',
-        formatter_class=argparse.RawTextHelpFormatter
+        description="Modify chromosome ends (telomeres) with a consensus sequence using MUMmer.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""
+Mode options (--mode):
+  replace: In 'replace' mode, the entire end of the reference sequence containing the alignment is removed 
+           and replaced with the corresponding end of the consensus sequence.
+  stitch:  In 'stitch' mode, the aligned region on the reference is kept as an anchor, and the consensus 
+           sequence is used to fill in the missing parts outside of this anchor.
+"""
     )
-    parser.add_argument('-r', '--reference', required=True, help='FASTA file of the original chromosome contigs.')
-    parser.add_argument('-c', '--consensus', required=True, help='FASTA file of the consensus telomere sequences.')
-    parser.add_argument('-o', '--output', required=True, help='Path for the output FASTA file with replaced ends.')
-    parser.add_argument('-i', '--min_identity', type=float, default=80.0, help='Minimum alignment identity percentage (default: 80.0).')
-    parser.add_argument('-e', '--end_region', type=int, default=20000, help='Size of the region (in bp) at each end to scan for telomeres (default: 20000).')
-    parser.add_argument('-p', '--processes', type=int, default=8, help='Number of parallel processes to use (default: 8).')
-    parser.add_argument('-s', '--start_threshold', type=int, default=100, help='Maximum start position (in bp) on the contig ends for a valid alignment (default: 100).')
-    
+    parser.add_argument("--mode", choices=['replace', 'stitch'], default='stitch', help="Choose the logic for end modification. (default: stitch)")
+    parser.add_argument("-r", "--ref", required=True, help="Path to the input reference sequence FASTA file.")
+    parser.add_argument("-c", "--consensus", required=True, help="Path to the consensus sequence FASTA file.")
+    parser.add_argument("-o", "--output", required=True, help="Path for the output FASTA file with modified sequences.")
+    parser.add_argument("-P", "--processes", type=int, default=8, help="Number of parallel processes.")
+    parser.add_argument("-T", "--nucmer_threads", type=int, default=8, help="Number of threads for each nucmer task.")
+    parser.add_argument("--min_identity", type=float, default=80.0, help="Minimum identity percentage for a valid alignment.")
+    parser.add_argument("--min_length", type=int, default=2000, help="Minimum length for a valid alignment.")
+    parser.add_argument("--search_margin", type=int, default=20000, help="Length of the fragment from each end to search for alignments.")
+    parser.add_argument("--end_distance", type=int, default=1000, help="Maximum distance from the sequence end for an alignment to be considered.")
     args = parser.parse_args()
     
+    log_queue = multiprocessing.Queue(-1)
+    listener_thread = threading.Thread(target=log_listener_process, args=(log_queue,))
+    listener_thread.start()
+    
+    worker_configurer(log_queue)
+    
+    logging.info(f"Script running in '{args.mode}' mode.")
+    total_threads, cpu_cores = args.processes * args.nucmer_threads, multiprocessing.cpu_count()
+    logging.info(f"Configuration: {args.processes} parallel processes, with {args.nucmer_threads} threads per nucmer task.")
+    if total_threads > cpu_cores:
+        logging.warning(f"Total threads ({total_threads}) > CPU cores ({cpu_cores}). This may lead to performance degradation!")
+
     try:
-        replace_telomeres_multi(
-            args.reference,
-            args.consensus,
-            args.output,
-            min_identity=args.min_identity,
-            end_region=args.end_region,
-            num_workers=args.processes,
-            start_threshold=args.start_threshold
-        )
-    except (ValueError, EnvironmentError, subprocess.CalledProcessError) as e:
-        logger.critical(f"\nAn error occurred: {e}", exc_info=True)
-    except Exception as e:
-        logger.critical(f"\nAn unexpected error occurred: {e}", exc_info=True)
+        consensus_records = {rec.id: rec for rec in SeqIO.parse(args.consensus, "fasta")}
+        if not consensus_records:
+            logging.critical(f"Consensus sequence file '{args.consensus}' is empty.")
+            sys.exit(1)
+        logging.info(f"Successfully read {len(consensus_records)} consensus sequences.")
+    except FileNotFoundError:
+        logging.critical(f"Consensus sequence file '{args.consensus}' not found.")
+        sys.exit(1)
+        
+    try:
+        ref_records = list(SeqIO.parse(args.ref, "fasta"))
+        if not ref_records:
+            logging.warning(f"Reference sequence file '{args.ref}' is empty.")
+            sys.exit(0)
+        logging.info(f"Found {len(ref_records)} reference sequences to process.\n")
+    except FileNotFoundError:
+        logging.critical(f"Reference sequence file '{args.ref}' not found.")
+        sys.exit(1)
+
+    modified_records = []
+    with ProcessPoolExecutor(max_workers=args.processes, initializer=worker_configurer, initargs=(log_queue,)) as executor:
+        try:
+            results_iterator = executor.map(process_ref_sequence, ref_records, repeat(consensus_records), repeat(args.consensus), repeat(args))
+            modified_records = list(results_iterator)
+        except Exception as e:
+            logging.critical(f"A critical error occurred during processing: {e}")
+            executor.shutdown(wait=True)
+            log_queue.put(None)
+            listener_thread.join()
+            sys.exit(1)
+
+    changed_count = sum(1 for rec in modified_records if rec.id.endswith('_ends_modified'))
+    logging.info(f"\nProcessing complete. {changed_count} out of {len(ref_records)} reference sequences were modified.")
+    
+    SeqIO.write(modified_records, args.output, "fasta")
+    logging.info(f"Results saved to: {args.output}")
+
+    log_queue.put(None)
+    listener_thread.join()
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    main()
