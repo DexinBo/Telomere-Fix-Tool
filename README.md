@@ -1,4 +1,4 @@
-# TeloFix
+# Telomere Fix Tool(TFT)
 
 A robust Python script to intelligently finish or correct the ends of DNA sequences (contigs) using a set of trusted consensus sequences. This tool leverages the MUMmer suite for high-speed alignment and provides two powerful modes for sequence modification.
 
@@ -33,8 +33,8 @@ The script follows this general workflow for each input reference sequence:
 
 1.  Clone this repository:
     ```bash
-    git clone <your-repository-url>
-    cd <repository-name>
+    git clone https://github.com/DexinBo/Telomere_fix_tool.git
+    cd Telomere_fix_tool
     ```
 2.  Ensure all software listed in the **Requirements** section is installed.
 
