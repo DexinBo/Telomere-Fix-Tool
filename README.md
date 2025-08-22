@@ -1,18 +1,19 @@
 # Patching Of Sequence Telomeres (POST)
 
-A robust Python script to intelligently finish or correct the ends of DNA sequences (contigs) using a set of trusted consensus sequences. This tool leverages the MUMmer suite for high-speed alignment and provides two powerful modes for sequence modification.
+**POST**: Telomere end correction tool leveraging consensus-guided alignment.
 
-It is designed for post-assembly processing tasks like closing gaps, circularizing plasmids, and standardizing sequence termini.
+##  Features
+- **Two core modes**: `stitch` (extend) and `replace` (correct)
+- **Reverse alignment handling**: smart parsing of `show-coords` including reverse-complement logic
+- **High-performance workflow**: fast filtering via `delta-filter`, refined by custom Python logic
+- **Parallel processing & robust logging**: uses `multiprocessing`, includes logging-safe queues and cleanup
+- **Temporary file management**: automatic cleanup of intermediate files
 
-## Key Features
-
-  - **Two Core Finishing Modes**:
-      - **Stitch Mode**: Extends sequence ends by preserving the aligned region as an anchor and appending the missing flanking sequence from the consensus.
-      - **Replace Mode**: Corrects sequence ends by completely replacing the entire terminal region (including the anchor) with the corresponding "golden standard" end from the consensus.
-  - **Accurate Reverse Alignment Handling**: Intelligently processes reverse alignments by correctly interpreting `show-coords` output (`start > end`) and applying the appropriate reverse-complement logic to the precise DNA fragment required.
-  - **Efficient Hybrid-Filtering Workflow**: Uses the high-performance `delta-filter` for an initial, broad-phase filtering of low-quality alignments, then applies a flexible, position-aware Python filter to find the optimal alignment at sequence ends.
-  - **High-Performance Parallel Processing**: Utilizes `multiprocessing` to process multiple reference sequences in parallel, significantly speeding up the analysis of large datasets.
-  - **Robust and Production-Ready**: Features a multiprocessing-safe logging system for clear progress tracking, robust error handling for external command execution, and automatic cleanup of all temporary files.
+##  Installation
+```bash
+git clone https://github.com/DexinBo/POST.git
+cd POST
+```
 
 ## Workflow
 
@@ -20,14 +21,14 @@ The script follows this general workflow for each input reference sequence:
 
 `Input Contig` -\> `Extract End Fragment` -\> `nucmer` -\> `delta-filter` -\> `show-coords` -\> `Custom Python Filtering` -\> `Apply Stitch/Replace Logic` -\> `Output Modified Contig`
 
-## Requirements
+---
 
-1.  **Python 3.7+**
-2.  **Biopython**:
-    ```bash
-    pip install biopython
-    ```
-3.  **MUMmer (v4)**: The `nucmer`, `delta-filter`, and `show-coords` executables must be installed and available in your system's `PATH`.
+##  Requirements
+- Python 3.7+
+- [Biopython](https://biopython.org/): `pip install biopython`
+- **MUMmer v4** tools (`nucmer`, `delta-filter`, `show-coords`) must be installed and in your `PATH`
+
+---
 
 ## Installation
 
@@ -79,16 +80,6 @@ python post.py --mode stitch \
     --search_margin 20000 \
     --end_distance 1000
 ```
-
-## Workflow Overview
-[Reference Contig] 
-   → [Extract end fragments] 
-   → [nucmer alignment] 
-   → [delta-filter] 
-   → [show-coords parsing] 
-   → [Filtering & validation] 
-   → [stitch/replace ends] 
-   → [Modified contig output]
 
 ## Core Logic: Stitch vs. Replace
 
