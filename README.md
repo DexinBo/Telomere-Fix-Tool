@@ -1,4 +1,4 @@
-# Telomere Fix Tool(TFT)
+# Patching Of Sequence Telomeres (POST)
 
 A robust Python script to intelligently finish or correct the ends of DNA sequences (contigs) using a set of trusted consensus sequences. This tool leverages the MUMmer suite for high-speed alignment and provides two powerful modes for sequence modification.
 
