@@ -68,13 +68,27 @@ python your_script_name.py --mode <stitch|replace> -r <reference.fasta> -c <cons
 To extend the ends of `my_contigs.fasta` using `complete_plasmids.fasta` as the reference, using 8 parallel processes, with each alignment using 4 threads:
 
 ```bash
-python your_script_name.py --mode stitch \
-    -r my_contigs.fasta \
-    -c complete_plasmids.fasta \
-    -o finished_contigs.fasta \
+python post.py --mode stitch \
+    -r ref.fasta \
+    -c consensus.fasta \
+    -o output.fasta \
     -P 8 \
-    -T 4
+    -T 4 \
+    --min_identity 80.0 \
+    --min_length 2000 \
+    --search_margin 20000 \
+    --end_distance 1000
 ```
+
+## Workflow Overview
+[Reference Contig] 
+   → [Extract end fragments] 
+   → [nucmer alignment] 
+   → [delta-filter] 
+   → [show-coords parsing] 
+   → [Filtering & validation] 
+   → [stitch/replace ends] 
+   → [Modified contig output]
 
 ## Core Logic: Stitch vs. Replace
 
